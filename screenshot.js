@@ -24,7 +24,9 @@ export const DEFAULT_CAPTURE_OPTIONS = {
     lazyScrollDelayMs: 100,
     tileSettleDelayMs: 250,
     imageLoadTimeoutMs: 8_000,
-    maxLazyScrollSteps: 1_000
+    maxLazyScrollSteps: 1_000,
+    hideSelectors: [],
+    keepSelectors: []
 };
 
 const REDUCED_MOTION_CSS = `
@@ -200,19 +202,385 @@ export async function lazyLoadPage(page, options = {}) {
     await delay(settings.tileSettleDelayMs);
 }
 
-export async function hideFixedAndStickyElements(page) {
-    return page.evaluate(() => {
+export async function suppressBlockingOverlays(page, options = {}) {
+    const settings = { ...DEFAULT_CAPTURE_OPTIONS, ...options };
+
+    await page.keyboard.press('Escape').catch(() => {});
+
+    return page.evaluate(async ({ hideSelectors, keepSelectors }) => {
+        const overlayNamePattern = /(?:^|[-_\s])(modal|popup|popover|overlay|backdrop|lightbox|interstitial|newsletter|subscribe|campaign|optin|lead[-_\s]?capture|wisepops|poptin|privy|klaviyo|hubspot|omnisend|sleeknote|optinmonster)(?:$|[-_\s])/i;
+        const closeLabelPattern = /^(?:close|dismiss|no thanks|not now|maybe later|skip|×|✕|x)$/i;
+        const hiddenAttribute = 'data-cli-sc-tool-overlay-hidden';
+
+        function collectRoots() {
+            const roots = [];
+            const queuedDocuments = [document];
+            const seenDocuments = new Set();
+
+            while (queuedDocuments.length > 0) {
+                const currentDocument = queuedDocuments.shift();
+                if (!currentDocument || seenDocuments.has(currentDocument)) {
+                    continue;
+                }
+                seenDocuments.add(currentDocument);
+                roots.push(currentDocument);
+
+                for (const element of currentDocument.querySelectorAll('*')) {
+                    if (element.shadowRoot) {
+                        roots.push(element.shadowRoot);
+                    }
+                    if (element.tagName === 'IFRAME') {
+                        try {
+                            if (element.contentDocument) {
+                                queuedDocuments.push(element.contentDocument);
+                            }
+                        } catch {
+                            // Cross-origin frames cannot be inspected from the page.
+                        }
+                    }
+                }
+            }
+            return roots;
+        }
+
+        function queryAll(roots, selector) {
+            const matches = [];
+            for (const root of roots) {
+                try {
+                    matches.push(...root.querySelectorAll(selector));
+                } catch (error) {
+                    throw new Error(`Invalid overlay selector "${selector}": ${error.message}`);
+                }
+            }
+            return matches;
+        }
+
+        function composedParent(element) {
+            return element.parentElement ?? element.getRootNode()?.host ?? null;
+        }
+
+        function isRelatedToKeptElement(element, keptElements) {
+            for (let current = element; current; current = composedParent(current)) {
+                if (keptElements.has(current)) {
+                    return true;
+                }
+            }
+            for (const keptElement of keptElements) {
+                for (let current = keptElement; current; current = composedParent(current)) {
+                    if (current === element) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        function elementLabel(element) {
+            return [
+                element.getAttribute('aria-label'),
+                element.getAttribute('title'),
+                element.getAttribute('value'),
+                element.textContent
+            ]
+                .filter(Boolean)
+                .map(value => value.trim())
+                .find(Boolean) ?? '';
+        }
+
+        function findCloseControls(element) {
+            const controls = element.matches('button, [role="button"], a, input[type="button"], input[type="submit"], [data-dismiss], [data-close]')
+                ? [element]
+                : [];
+            controls.push(...element.querySelectorAll(
+                'button, [role="button"], a, input[type="button"], input[type="submit"], [data-dismiss], [data-close]'
+            ));
+
+            return controls.filter(control => {
+                if (control.matches('[data-dismiss], [data-close]')) {
+                    return true;
+                }
+                const label = elementLabel(control);
+                if (!closeLabelPattern.test(label)) {
+                    return false;
+                }
+                if (control.tagName !== 'A') {
+                    return true;
+                }
+                const href = control.getAttribute('href');
+                return !href || href.startsWith('#') || href.startsWith('javascript:');
+            });
+        }
+
+        function visibleGeometry(element) {
+            const view = element.ownerDocument.defaultView;
+            if (!view) {
+                return null;
+            }
+            const style = view.getComputedStyle(element);
+            const rectangle = element.getBoundingClientRect();
+            const viewportWidth = Math.max(1, view.innerWidth);
+            const viewportHeight = Math.max(1, view.innerHeight);
+            const visibleWidth = Math.max(
+                0,
+                Math.min(rectangle.right, viewportWidth) - Math.max(rectangle.left, 0)
+            );
+            const visibleHeight = Math.max(
+                0,
+                Math.min(rectangle.bottom, viewportHeight) - Math.max(rectangle.top, 0)
+            );
+            const coverage = (visibleWidth * visibleHeight) / (viewportWidth * viewportHeight);
+            const opacity = Number.parseFloat(style.opacity);
+
+            if (
+                style.display === 'none'
+                || style.visibility === 'hidden'
+                || Number.isFinite(opacity) && opacity <= 0.01
+                || visibleWidth < 20
+                || visibleHeight < 20
+            ) {
+                return null;
+            }
+
+            const backgroundColor = style.backgroundColor.match(/[\d.]+/g)?.map(Number) ?? [];
+            const backgroundAlpha = backgroundColor.length === 4 ? backgroundColor[3] : (
+                backgroundColor.length >= 3 && backgroundColor.some(channel => channel > 0) ? 1 : 0
+            );
+
+            return {
+                style,
+                coverage,
+                backgroundAlpha,
+                zIndex: Number.parseInt(style.zIndex, 10) || 0
+            };
+        }
+
+        function documentIsScrollLocked(currentDocument) {
+            const view = currentDocument.defaultView;
+            if (!view) {
+                return false;
+            }
+            return [currentDocument.documentElement, currentDocument.body].filter(Boolean).some(element => {
+                const style = view.getComputedStyle(element);
+                return style.overflow === 'hidden'
+                    || style.overflow === 'clip'
+                    || style.overflowY === 'hidden'
+                    || style.overflowY === 'clip'
+                    || element === currentDocument.body && style.position === 'fixed';
+            });
+        }
+
+        function findCandidates(roots, keptElements) {
+            const candidates = [];
+            const geometryByElement = new Map();
+            const elements = roots.flatMap(root => [...root.querySelectorAll('*')]);
+            const scrollLockedDocuments = new Set(
+                roots
+                    .map(root => root.ownerDocument ?? root)
+                    .filter(currentDocument => currentDocument?.documentElement)
+                    .filter(documentIsScrollLocked)
+            );
+
+            for (const element of elements) {
+                if (
+                    element.hasAttribute(hiddenAttribute)
+                    || isRelatedToKeptElement(element, keptElements)
+                ) {
+                    continue;
+                }
+
+                const geometry = visibleGeometry(element);
+                if (!geometry) {
+                    continue;
+                }
+                geometryByElement.set(element, geometry);
+
+                const role = element.getAttribute('role')?.toLowerCase();
+                const isSemanticDialog = element.matches('dialog[open], [aria-modal="true"]')
+                    || role === 'dialog'
+                    || role === 'alertdialog';
+                const identity = [
+                    element.id,
+                    typeof element.className === 'string' ? element.className : '',
+                    element.getAttribute('data-testid'),
+                    element.getAttribute('data-component')
+                ].filter(Boolean).join(' ');
+                const hasModalName = overlayNamePattern.test(identity);
+                const hasCloseControl = findCloseControls(element).length > 0;
+                const fixed = geometry.style.position === 'fixed';
+                const highStackingOrder = geometry.zIndex >= 10;
+                const containsSemanticDialog = Boolean(element.querySelector(
+                    'dialog[open], [aria-modal="true"], [role="dialog"], [role="alertdialog"]'
+                ));
+
+                const isBlocking = (
+                    isSemanticDialog
+                    && (fixed || geometry.coverage >= 0.04 || highStackingOrder)
+                ) || (
+                    fixed
+                    && geometry.coverage >= 0.45
+                    && (hasCloseControl || hasModalName || containsSemanticDialog)
+                ) || (
+                    fixed
+                    && geometry.coverage >= 0.04
+                    && highStackingOrder
+                    && hasModalName
+                ) || (
+                    fixed
+                    && geometry.coverage >= 0.04
+                    && highStackingOrder
+                    && hasCloseControl
+                );
+
+                if (isBlocking) {
+                    candidates.push(element);
+                }
+            }
+
+            if (candidates.length > 0 || scrollLockedDocuments.size > 0) {
+                for (const [element, geometry] of geometryByElement) {
+                    if (
+                        candidates.includes(element)
+                        || geometry.style.position !== 'fixed'
+                        || geometry.coverage < 0.75
+                        || geometry.zIndex < 10
+                        || geometry.backgroundAlpha < 0.1
+                        || isRelatedToKeptElement(element, keptElements)
+                    ) {
+                        continue;
+                    }
+                    candidates.push(element);
+                }
+            }
+
+            return { candidates, scrollLockedDocuments };
+        }
+
+        function unlockDocument(currentDocument) {
+            let changed = false;
+            const view = currentDocument.defaultView;
+            if (!view) {
+                return changed;
+            }
+
+            for (const element of [currentDocument.documentElement, currentDocument.body].filter(Boolean)) {
+                const style = view.getComputedStyle(element);
+                if (
+                    style.overflow === 'hidden'
+                    || style.overflow === 'clip'
+                    || style.overflowY === 'hidden'
+                    || style.overflowY === 'clip'
+                ) {
+                    element.style.setProperty('overflow-y', 'auto', 'important');
+                    changed = true;
+                }
+            }
+
+            const body = currentDocument.body;
+            if (body && view.getComputedStyle(body).position === 'fixed') {
+                body.style.setProperty('position', 'static', 'important');
+                body.style.setProperty('inset', 'auto', 'important');
+                body.style.setProperty('width', 'auto', 'important');
+                changed = true;
+            }
+            return changed;
+        }
+
+        const rootsBeforeDismissal = collectRoots();
+        const keptElementsBeforeDismissal = new Set(
+            keepSelectors.flatMap(selector => queryAll(rootsBeforeDismissal, selector))
+        );
+        const initial = findCandidates(rootsBeforeDismissal, keptElementsBeforeDismissal);
+        const clickedControls = new Set();
+
+        for (const candidate of initial.candidates) {
+            const closeControl = findCloseControls(candidate).find(control => !clickedControls.has(control));
+            if (closeControl) {
+                clickedControls.add(closeControl);
+                closeControl.click();
+            }
+        }
+
+        if (clickedControls.size > 0) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+        }
+
+        const roots = collectRoots();
+        const keptElements = new Set(keepSelectors.flatMap(selector => queryAll(roots, selector)));
+        const explicitElements = new Set(hideSelectors.flatMap(selector => queryAll(roots, selector)));
+        const detected = findCandidates(roots, keptElements);
+        const elementsToHide = new Set([...explicitElements, ...detected.candidates]);
+        let hidden = 0;
+
+        for (const element of elementsToHide) {
+            if (isRelatedToKeptElement(element, keptElements)) {
+                continue;
+            }
+            element.setAttribute(hiddenAttribute, 'true');
+            element.style.setProperty('opacity', '0', 'important');
+            element.style.setProperty('visibility', 'hidden', 'important');
+            element.style.setProperty('pointer-events', 'none', 'important');
+            hidden += 1;
+        }
+
+        const documentsToUnlock = new Set([
+            ...initial.scrollLockedDocuments,
+            ...detected.scrollLockedDocuments
+        ]);
+        const hasSuppressedOverlay = hidden > 0 || clickedControls.size > 0;
+        let scrollUnlocked = 0;
+        if (hasSuppressedOverlay) {
+            for (const currentDocument of documentsToUnlock) {
+                if (unlockDocument(currentDocument)) {
+                    scrollUnlocked += 1;
+                }
+            }
+        }
+
+        const totalHidden = collectRoots().reduce(
+            (total, root) => total + root.querySelectorAll(`[${hiddenAttribute}]`).length,
+            0
+        );
+        return {
+            dismissed: clickedControls.size,
+            hidden,
+            totalHidden,
+            scrollUnlocked
+        };
+    }, {
+        hideSelectors: settings.hideSelectors ?? [],
+        keepSelectors: settings.keepSelectors ?? []
+    });
+}
+
+export async function hideFixedAndStickyElements(page, keepSelectors = []) {
+    return page.evaluate(selectors => {
         let hidden = 0;
         const elements = [...document.querySelectorAll('body *')];
+        const keptElements = new Set();
 
         for (let index = 0; index < elements.length; index += 1) {
             const element = elements[index];
             if (element.shadowRoot) {
                 elements.push(...element.shadowRoot.querySelectorAll('*'));
             }
+        }
 
+        for (const selector of selectors) {
+            for (const root of [document, ...elements.map(element => element.shadowRoot).filter(Boolean)]) {
+                try {
+                    root.querySelectorAll(selector).forEach(element => keptElements.add(element));
+                } catch (error) {
+                    throw new Error(`Invalid keep selector "${selector}": ${error.message}`);
+                }
+            }
+        }
+
+        for (const element of elements) {
             const position = getComputedStyle(element).position;
             if (position !== 'fixed' && position !== 'sticky') {
+                continue;
+            }
+            if ([...keptElements].some(kept => element === kept || element.contains(kept) || kept.contains(element))) {
                 continue;
             }
 
@@ -224,7 +592,7 @@ export async function hideFixedAndStickyElements(page) {
             hidden += 1;
         }
         return hidden;
-    });
+    }, keepSelectors);
 }
 
 async function hashFile(filePath) {
@@ -323,6 +691,7 @@ export async function captureLongPage(page, {
     pageHeight,
     outputDirectory,
     filename,
+    overlaysSuppressed = 0,
     options = {}
 }) {
     const settings = { ...DEFAULT_CAPTURE_OPTIONS, ...options };
@@ -332,7 +701,9 @@ export async function captureLongPage(page, {
     const stitchedCandidate = path.join(tileDirectory, 'stitched.png');
 
     try {
-        await hideFixedAndStickyElements(page);
+        const initialOverlayResult = await suppressBlockingOverlays(page, settings);
+        overlaysSuppressed += initialOverlayResult.dismissed + initialOverlayResult.hidden;
+        await hideFixedAndStickyElements(page, settings.keepSelectors);
         const plan = buildTilePlan(pageHeight, settings.viewportHeight, settings.tileOverlap);
         const tiles = [];
 
@@ -345,7 +716,9 @@ export async function captureLongPage(page, {
             );
             // Widgets can be inserted or restyled while the page scrolls. Reapply
             // suppression immediately before every tile capture.
-            await hideFixedAndStickyElements(page);
+            const overlayResult = await suppressBlockingOverlays(page, settings);
+            overlaysSuppressed += overlayResult.dismissed + overlayResult.hidden;
+            await hideFixedAndStickyElements(page, settings.keepSelectors);
 
             const tilePath = path.join(tileDirectory, `tile-${String(index).padStart(4, '0')}-${segment.y}px.png`);
             await page.screenshot({
@@ -391,7 +764,8 @@ export async function captureLongPage(page, {
             outputPath,
             width: metadata.width,
             height: metadata.height,
-            tileCount: tiles.length
+            tileCount: tiles.length,
+            overlaysSuppressed
         };
     } catch (error) {
         const failureDetails = {
@@ -428,14 +802,27 @@ export async function captureUrlAtWidth(page, {
     await page.goto(url, { waitUntil: 'networkidle2' });
     await installReducedMotionStyles(page);
     await delay(settings.initialSettleDelayMs);
+    const initialOverlayResult = await suppressBlockingOverlays(page, settings);
     await lazyLoadPage(page, settings);
+    const finalOverlayResult = await suppressBlockingOverlays(page, settings);
 
     const pageHeight = await measureFullPageHeight(page);
     const outputPath = outputPathFor(url, width, outputDirectory);
+    const overlaysSuppressed = initialOverlayResult.dismissed
+        + initialOverlayResult.hidden
+        + finalOverlayResult.dismissed
+        + finalOverlayResult.hidden;
 
     if (!shouldUseTiledCapture(width, pageHeight, settings)) {
         await page.screenshot({ path: outputPath, fullPage: true });
-        return { mode: 'single', outputPath, width, height: pageHeight, tileCount: 1 };
+        return {
+            mode: 'single',
+            outputPath,
+            width,
+            height: pageHeight,
+            tileCount: 1,
+            overlaysSuppressed
+        };
     }
 
     return captureLongPage(page, {
@@ -444,6 +831,7 @@ export async function captureUrlAtWidth(page, {
         pageHeight,
         outputDirectory,
         filename: path.basename(outputPath, '.png'),
+        overlaysSuppressed,
         options: settings
     });
 }
@@ -452,6 +840,8 @@ export function parseArguments(args, cwd = process.cwd()) {
     const urls = [];
     let viewportWidths = [1024];
     let outputDirectory = path.join(cwd, 'screenshots');
+    const hideSelectors = [];
+    const keepSelectors = [];
 
     for (let index = 0; index < args.length; index += 1) {
         const argument = args[index];
@@ -491,6 +881,10 @@ export function parseArguments(args, cwd = process.cwd()) {
             }
         } else if (argument === '--output' && args[index + 1]) {
             outputDirectory = args[index += 1];
+        } else if (argument === '--hide-selector' && args[index + 1]) {
+            hideSelectors.push(args[index += 1]);
+        } else if (argument === '--keep-selector' && args[index + 1]) {
+            keepSelectors.push(args[index += 1]);
         } else if (argument.startsWith('--')) {
             console.warn(`Unknown argument: ${argument}`);
         }
@@ -501,11 +895,16 @@ export function parseArguments(args, cwd = process.cwd()) {
         urls.push('https://q30design.com/about/');
     }
 
-    return { urls, viewportWidths, outputDirectory };
+    return {
+        urls,
+        viewportWidths,
+        outputDirectory,
+        captureOptions: { hideSelectors, keepSelectors }
+    };
 }
 
 export async function takeScreenshots(args = process.argv.slice(2), launchOptions = {}) {
-    const { urls, viewportWidths, outputDirectory } = parseArguments(args);
+    const { urls, viewportWidths, outputDirectory, captureOptions } = parseArguments(args);
     await fsPromises.mkdir(outputDirectory, { recursive: true });
 
     const browser = await puppeteer.launch(launchOptions);
@@ -520,11 +919,17 @@ export async function takeScreenshots(args = process.argv.slice(2), launchOption
                     const result = await captureUrlAtWidth(page, {
                         url,
                         width,
-                        outputDirectory
+                        outputDirectory,
+                        options: captureOptions
                     });
                     results.push(result);
                     const detail = result.mode === 'tiled' ? ` (${result.tileCount} stitched tiles)` : '';
-                    console.log(`Screenshot saved for ${url} at ${result.outputPath} with width ${width}px${detail}`);
+                    const overlayDetail = result.overlaysSuppressed > 0
+                        ? `; suppressed ${result.overlaysSuppressed} blocking overlay element(s)`
+                        : '';
+                    console.log(
+                        `Screenshot saved for ${url} at ${result.outputPath} with width ${width}px${detail}${overlayDetail}`
+                    );
                 } catch (error) {
                     failed = true;
                     console.error(`Failed to take screenshot for ${url} with width ${width}px: ${error.message}`);

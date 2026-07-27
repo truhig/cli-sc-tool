@@ -12,6 +12,7 @@ import {
     buildTilePlan,
     captureUrlAtWidth,
     outputPathFor,
+    parseArguments,
     shouldUseTiledCapture
 } from '../screenshot.js';
 
@@ -52,6 +53,73 @@ function fixtureFor(pathname) {
         return pageHtml(
             '<main></main><footer></footer>',
             'main { height: 1200px; background: #2864dc; } footer { height: 200px; background: #00a050; }'
+        );
+    }
+
+    if (pathname === '/blocking-modal') {
+        return pageHtml(
+            `
+                <main></main>
+                <footer></footer>
+                <div class="campaign-backdrop"></div>
+                <section class="promotion" role="dialog" aria-modal="true" aria-label="Promotion">
+                    <button aria-label="Close">CLOSE</button>
+                </section>
+            `,
+            `
+                html, body { overflow: hidden; }
+                main { height: 1200px; background: #2864dc; }
+                footer { height: 200px; background: #00a050; }
+                .campaign-backdrop { position: fixed; inset: 0; z-index: 1000; background: rgba(0, 0, 0, 0.75); }
+                .promotion { position: fixed; inset: 100px 40px auto; z-index: 1001; height: 300px; background: #ff0000; }
+                .promotion button { position: absolute; right: 0; top: 0; }
+            `,
+            `
+                document.querySelector('.promotion button').addEventListener('click', () => {
+                    document.querySelector('.promotion').remove();
+                    document.documentElement.style.overflow = '';
+                    document.body.style.overflow = '';
+                });
+            `
+        );
+    }
+
+    if (pathname === '/delayed-modal') {
+        return pageHtml(
+            '<main></main><footer></footer>',
+            'main { height: 1200px; background: #2864dc; } footer { height: 200px; background: #00a050; }',
+            `
+                setTimeout(() => {
+                    document.body.style.overflow = 'hidden';
+                    const overlay = document.createElement('div');
+                    overlay.className = 'newsletter-overlay';
+                    overlay.innerHTML = '<button aria-label="Close">×</button>';
+                    overlay.style.cssText = 'position:fixed;inset:0;z-index:500;background:#ff0000';
+                    document.body.append(overlay);
+                }, 25);
+            `
+        );
+    }
+
+    if (pathname === '/legitimate-fixed-content') {
+        return pageHtml(
+            '<div class="visual-treatment"></div><main></main><footer></footer>',
+            `
+                .visual-treatment { position: fixed; inset: 0; z-index: 20; background: #8a2be2; }
+                main { height: 1200px; }
+                footer { height: 200px; }
+            `
+        );
+    }
+
+    if (pathname === '/custom-overlay') {
+        return pageHtml(
+            '<main></main><div id="site-specific-blocker"></div><div id="preserved-dialog" role="dialog"></div>',
+            `
+                main { height: 1400px; background: #2864dc; }
+                #site-specific-blocker { position: fixed; inset: 0; z-index: 100; background: #ff0000; }
+                #preserved-dialog { position: fixed; left: 20px; top: 20px; z-index: 101; width: 100px; height: 100px; background: #00ff00; }
+            `
         );
     }
 
@@ -160,6 +228,20 @@ test('uses a bounded overlapping tile plan that ends at the true page bottom', (
     assert.equal(shouldUseTiledCapture(10_000, 21_000), true);
 });
 
+test('parses repeatable site-specific hide and keep selectors', () => {
+    const parsed = parseArguments([
+        '--url', 'https://example.com',
+        '--hide-selector', '#promotion',
+        '--hide-selector', '.newsletter',
+        '--keep-selector', '.comparison-toolbar'
+    ]);
+
+    assert.deepEqual(parsed.captureOptions, {
+        hideSelectors: ['#promotion', '.newsletter'],
+        keepSelectors: ['.comparison-toolbar']
+    });
+});
+
 test('keeps the one-shot fullPage path and filename for a normal page', async () => {
     const result = await captureFixture('/normal');
     const metadata = await sharp(result.outputPath).metadata();
@@ -168,6 +250,65 @@ test('keeps the one-shot fullPage path and filename for a normal page', async ()
     assert.equal(result.outputPath, outputPathFor(`${baseUrl}/normal`, 400, outputDirectory));
     assert.equal(metadata.width, 400);
     assert.equal(metadata.height, 1_400);
+});
+
+test('dismisses a blocking modal, removes its backdrop, and restores scrolling on the one-shot path', async () => {
+    const result = await captureFixture('/blocking-modal');
+    const { data, info } = await sharp(result.outputPath)
+        .removeAlpha()
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+
+    let redPixels = 0;
+    let darkPixels = 0;
+    for (let offset = 0; offset < data.length; offset += info.channels) {
+        if (data[offset] > 245 && data[offset + 1] < 20 && data[offset + 2] < 20) {
+            redPixels += 1;
+        }
+        if (data[offset] < 30 && data[offset + 1] < 30 && data[offset + 2] < 30) {
+            darkPixels += 1;
+        }
+    }
+
+    assert.equal(result.mode, 'single');
+    assert.ok(result.overlaysSuppressed >= 2);
+    assert.equal(info.width, 400);
+    assert.equal(info.height, 1_400);
+    assert.equal(redPixels, 0);
+    assert.equal(darkPixels, 0);
+});
+
+test('suppresses a blocking overlay inserted after the initial page settle', async () => {
+    const result = await captureFixture('/delayed-modal');
+    const topPixel = await pixelAt(result.outputPath, 200, 200);
+
+    assert.equal(result.mode, 'single');
+    assert.ok(result.overlaysSuppressed >= 1);
+    assert.deepEqual(topPixel, [40, 100, 220]);
+});
+
+test('does not remove legitimate fixed full-viewport visual content', async () => {
+    const result = await captureFixture('/legitimate-fixed-content');
+    const topPixel = await pixelAt(result.outputPath, 200, 200);
+
+    assert.equal(result.mode, 'single');
+    assert.equal(result.overlaysSuppressed, 0);
+    assert.deepEqual(topPixel, [138, 43, 226]);
+});
+
+test('supports explicit hide and keep selectors for site-specific overrides', async () => {
+    const result = await captureFixture('/custom-overlay', {
+        ...TEST_CAPTURE_OPTIONS,
+        hideSelectors: ['#site-specific-blocker'],
+        keepSelectors: ['#preserved-dialog']
+    });
+    const blockerPixel = await pixelAt(result.outputPath, 200, 200);
+    const preservedPixel = await pixelAt(result.outputPath, 50, 50);
+
+    assert.equal(result.mode, 'single');
+    assert.ok(result.overlaysSuppressed >= 1);
+    assert.deepEqual(blockerPixel, [40, 100, 220]);
+    assert.deepEqual(preservedPixel, [0, 255, 0]);
 });
 
 test('stitches a long page through its true footer without keeping temporary tiles', async () => {

@@ -6,6 +6,8 @@ This is a Node.js script that uses Puppeteer to capture full-page screenshots of
 
 Pages up to 28,000px tall use Puppeteer's existing one-shot `fullPage` capture, preserving the established URL-and-width filename format. Taller pages, or pages whose estimated image size approaches browser rendering limits, are captured in overlapping viewport tiles and stitched into one PNG.
 
+Before lazy loading and again immediately before capture, the tool suppresses high-confidence blocking overlays such as open dialogs, promotional popovers, lightboxes, and their backdrops. Detection combines dialog semantics, fixed-position viewport coverage, stacking order, dismiss controls, modal-related names, and page scroll locks. It first attempts a safe dismissal, then hides any remaining blocker and restores document scrolling. Legitimate fixed visual elements are left alone unless they also exhibit modal behavior.
+
 Before every tile, the page is locked to the exact scroll offset and allowed to settle. Fixed and sticky UI is suppressed—including widgets rendered through zero-size hosts or open shadow DOM—so headers, modals, and accessibility launchers do not repeat at tile joins. The stitched result is validated before it replaces the final output file.
 
 ## Installation
@@ -62,6 +64,18 @@ The script can be run with command-line arguments to specify URLs, viewport widt
     *   **'all'**: Captures screenshots for all defined named breakpoints.
     *   Can be a comma-separated list of any combination (e.g., `mobile,1024,desktop-xl`).
 *   `--output <path>`: Sets the output directory for saving screenshots. This path can be absolute or relative to where you execute the script.
+*   `--hide-selector <css_selector>`: Always hides elements matching this selector. Repeat the option to supply multiple site-specific blockers.
+*   `--keep-selector <css_selector>`: Prevents matching elements from being classified as overlays or suppressed as fixed/sticky UI. Repeat the option to preserve multiple elements.
+
+For example, to remove a site-specific promotion while preserving a fixed comparison control:
+
+```bash
+node screenshot.js \
+  --url https://example.com \
+  --width mobile,desktop \
+  --hide-selector '#seasonal-promotion' \
+  --keep-selector '.comparison-toolbar'
+```
 
 ## Long-page failure handling
 
@@ -69,7 +83,7 @@ Tiled captures are checked for the requested width, a height close to the measur
 
 ## Tests
 
-The browser tests cover the normal one-shot path, a long page reaching its true footer, lazy-loaded content, fixed and shadow-DOM overlays, successful temporary-file cleanup, and retained diagnostics for repeated-tile failures:
+The browser tests cover the normal one-shot path, semantic and delayed blocking overlays, scroll-lock recovery, explicit selector overrides, false-positive protection for legitimate fixed content, a long page reaching its true footer, lazy-loaded content, fixed and shadow-DOM overlays, successful temporary-file cleanup, and retained diagnostics for repeated-tile failures:
 
 ```bash
 npm test
