@@ -11,6 +11,7 @@ import sharp from 'sharp';
 import {
     buildTilePlan,
     captureUrlAtWidth,
+    captureUrlWithRetry,
     outputPathFor,
     parseArguments,
     shouldUseTiledCapture
@@ -23,13 +24,18 @@ const TEST_CAPTURE_OPTIONS = {
     initialSettleDelayMs: 10,
     lazyScrollDelayMs: 10,
     tileSettleDelayMs: 20,
-    imageLoadTimeoutMs: 500
+    imageLoadTimeoutMs: 500,
+    assetReadyTimeoutMs: 500,
+    layoutStabilityTimeoutMs: 500,
+    layoutStabilityIntervalMs: 20,
+    layoutStableSamples: 2
 };
 
 let browser;
 let server;
 let baseUrl;
 let outputDirectory;
+const requestCounts = new Map();
 
 function pageHtml(body, styles = '', script = '') {
     return `<!doctype html>
@@ -48,7 +54,7 @@ function pageHtml(body, styles = '', script = '') {
         </html>`;
 }
 
-function fixtureFor(pathname) {
+function fixtureFor(pathname, requestCount = 1) {
     if (pathname === '/normal') {
         return pageHtml(
             '<main></main><footer></footer>',
@@ -121,6 +127,61 @@ function fixtureFor(pathname) {
                 #preserved-dialog { position: fixed; left: 20px; top: 20px; z-index: 101; width: 100px; height: 100px; background: #00ff00; }
             `
         );
+    }
+
+    if (pathname === '/stateful-layout') {
+        const paragraphs = Array.from(
+            { length: 10 },
+            (_, index) => `<p>Stable responsive content ${index + 1}: ${'membership amenities and community connections '.repeat(4)}</p>`
+        ).join('');
+        return pageHtml(
+            `<main><div class="content">${paragraphs}</div></main>`,
+            `
+                main { min-height: 1200px; background: #2864dc; padding: 20px; }
+                .content { box-sizing: border-box; width: 900px; max-width: 100%; margin: auto; background: white; }
+                body.stale .content { width: 40px; }
+            `,
+            `
+                const visits = Number(localStorage.getItem('capture-visits') || 0);
+                localStorage.setItem('capture-visits', String(visits + 1));
+                if (visits > 0) document.body.classList.add('stale');
+            `
+        );
+    }
+
+    if (pathname === '/unstable-layout') {
+        const paragraphs = Array.from(
+            { length: 10 },
+            (_, index) => `<p>Responsive layout content ${index + 1}: ${'wellness dining activities and resident benefits '.repeat(4)}</p>`
+        ).join('');
+        return pageHtml(
+            `<main><div class="content">${paragraphs}</div></main>`,
+            `
+                main { min-height: 1200px; background: #2864dc; padding: 20px; }
+                .content {
+                    box-sizing: border-box;
+                    width: ${requestCount === 1 ? '40px' : '900px'};
+                    max-width: 100%;
+                    margin: auto;
+                    background: white;
+                }
+            `
+        );
+    }
+
+    if (pathname === '/asset-retry') {
+        const paragraphs = Array.from(
+            { length: 10 },
+            (_, index) => `<p>Critical stylesheet content ${index + 1}: ${'club services social programs and concierge access '.repeat(4)}</p>`
+        ).join('');
+        return `<!doctype html>
+            <html>
+                <head>
+                    <meta charset="utf-8">
+                    <link rel="stylesheet" href="/critical-style.css">
+                </head>
+                <body><main>${paragraphs}</main></body>
+            </html>`;
     }
 
     if (pathname === '/practice-areas/personal-injury-lawyers/') {
@@ -202,8 +263,27 @@ async function pixelAt(imagePath, left, top) {
 test.before(async () => {
     outputDirectory = await mkdtemp(path.join(os.tmpdir(), 'cli-sc-tool-test-'));
     server = http.createServer((request, response) => {
+        const pathname = new URL(request.url, 'http://localhost').pathname;
+        const requestCount = (requestCounts.get(pathname) ?? 0) + 1;
+        requestCounts.set(pathname, requestCount);
+
+        if (pathname === '/critical-style.css') {
+            if (requestCount === 1) {
+                response.writeHead(503, { 'content-type': 'text/css' });
+                response.end('/* temporarily unavailable */');
+            } else {
+                response.writeHead(200, { 'content-type': 'text/css' });
+                response.end(`
+                    html, body { margin: 0; }
+                    main { box-sizing: border-box; min-height: 1200px; padding: 30px; background: #00a050; }
+                    p { max-width: 900px; margin: 20px auto; }
+                `);
+            }
+            return;
+        }
+
         response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-        response.end(fixtureFor(new URL(request.url, 'http://localhost').pathname));
+        response.end(fixtureFor(pathname, requestCount));
     });
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     const address = server.address();
@@ -250,6 +330,55 @@ test('keeps the one-shot fullPage path and filename for a normal page', async ()
     assert.equal(result.outputPath, outputPathFor(`${baseUrl}/normal`, 400, outputDirectory));
     assert.equal(metadata.width, 400);
     assert.equal(metadata.height, 1_400);
+});
+
+test('isolates browser storage and page state for every capture', async () => {
+    const first = await captureUrlWithRetry(browser, {
+        url: `${baseUrl}/stateful-layout`,
+        width: 1_366,
+        outputDirectory,
+        options: TEST_CAPTURE_OPTIONS
+    });
+    const second = await captureUrlWithRetry(browser, {
+        url: `${baseUrl}/stateful-layout`,
+        width: 1_366,
+        outputDirectory,
+        options: TEST_CAPTURE_OPTIONS
+    });
+
+    assert.equal(first.attempts, 1);
+    assert.equal(second.attempts, 1);
+    assert.equal(first.diagnostics.layout.valid, true);
+    assert.equal(second.diagnostics.layout.valid, true);
+});
+
+test('retries an abnormally narrow desktop layout in a fresh browser context', async () => {
+    const result = await captureUrlWithRetry(browser, {
+        url: `${baseUrl}/unstable-layout`,
+        width: 1_366,
+        outputDirectory,
+        options: TEST_CAPTURE_OPTIONS
+    });
+    const metadata = await sharp(result.outputPath).metadata();
+
+    assert.equal(result.attempts, 2);
+    assert.match(result.retryReasons[0], /Suspicious page layout detected/);
+    assert.equal(result.diagnostics.layout.valid, true);
+    assert.equal(metadata.width, 1_366);
+});
+
+test('retries when a critical stylesheet fails to load', async () => {
+    const result = await captureUrlWithRetry(browser, {
+        url: `${baseUrl}/asset-retry`,
+        width: 1_366,
+        outputDirectory,
+        options: TEST_CAPTURE_OPTIONS
+    });
+    const backgroundPixel = await pixelAt(result.outputPath, 10, 10);
+
+    assert.equal(result.attempts, 2);
+    assert.match(result.retryReasons[0], /Critical page assets failed to load/);
+    assert.deepEqual(backgroundPixel, [0, 160, 80]);
 });
 
 test('dismisses a blocking modal, removes its backdrop, and restores scrolling on the one-shot path', async () => {

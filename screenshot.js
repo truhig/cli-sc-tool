@@ -24,6 +24,11 @@ export const DEFAULT_CAPTURE_OPTIONS = {
     lazyScrollDelayMs: 100,
     tileSettleDelayMs: 250,
     imageLoadTimeoutMs: 8_000,
+    assetReadyTimeoutMs: 8_000,
+    layoutStabilityTimeoutMs: 5_000,
+    layoutStabilityIntervalMs: 250,
+    layoutStableSamples: 3,
+    maxCaptureAttempts: 2,
     maxLazyScrollSteps: 1_000,
     hideSelectors: [],
     keepSelectors: []
@@ -43,6 +48,272 @@ const REDUCED_MOTION_CSS = `
 
 function delay(milliseconds) {
     return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function createAssetMonitor(page, pageUrl) {
+    const pageOrigin = new URL(pageUrl).origin;
+    const failures = [];
+
+    const recordFailure = (request, detail) => {
+        const resourceType = request.resourceType();
+        const requestUrl = request.url();
+        const isSameOrigin = (() => {
+            try {
+                return new URL(requestUrl).origin === pageOrigin;
+            } catch {
+                return false;
+            }
+        })();
+        const critical = resourceType === 'stylesheet'
+            || resourceType === 'script' && isSameOrigin;
+
+        failures.push({
+            url: requestUrl,
+            resourceType,
+            critical,
+            ...detail
+        });
+    };
+
+    const onRequestFailed = request => {
+        recordFailure(request, {
+            errorText: request.failure()?.errorText ?? 'Request failed'
+        });
+    };
+    const onResponse = response => {
+        if (response.status() >= 400) {
+            recordFailure(response.request(), { status: response.status() });
+        }
+    };
+
+    page.on('requestfailed', onRequestFailed);
+    page.on('response', onResponse);
+
+    return {
+        failures,
+        stop() {
+            page.off('requestfailed', onRequestFailed);
+            page.off('response', onResponse);
+        }
+    };
+}
+
+export async function waitForPageAssets(
+    page,
+    timeoutMs = DEFAULT_CAPTURE_OPTIONS.assetReadyTimeoutMs
+) {
+    return page.evaluate(async timeout => {
+        const deadline = Date.now() + timeout;
+        const pause = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+
+        if (document.fonts) {
+            await Promise.race([
+                document.fonts.ready,
+                pause(Math.max(0, deadline - Date.now()))
+            ]);
+        }
+
+        const stylesheetLinks = [...document.querySelectorAll('link[rel~="stylesheet"][href]')];
+        while (
+            Date.now() < deadline
+            && stylesheetLinks.some(link => !link.disabled && !link.sheet)
+        ) {
+            await pause(50);
+        }
+
+        return {
+            fontStatus: document.fonts?.status ?? 'unsupported',
+            pendingStylesheets: stylesheetLinks
+                .filter(link => !link.disabled && !link.sheet)
+                .map(link => link.href)
+        };
+    }, timeoutMs);
+}
+
+async function layoutSignature(page) {
+    return page.evaluate(() => {
+        const documentElement = document.documentElement;
+        const body = document.body;
+        const primary = document.querySelector('main, [role="main"], #main, .site-main') ?? body;
+        const primaryRectangle = primary?.getBoundingClientRect();
+
+        return {
+            height: Math.ceil(Math.max(
+                body?.scrollHeight ?? 0,
+                body?.offsetHeight ?? 0,
+                documentElement.scrollHeight,
+                documentElement.offsetHeight
+            )),
+            width: Math.ceil(Math.max(
+                body?.scrollWidth ?? 0,
+                body?.offsetWidth ?? 0,
+                documentElement.scrollWidth,
+                documentElement.offsetWidth
+            )),
+            primaryWidth: Math.round(primaryRectangle?.width ?? 0),
+            primaryHeight: Math.round(primaryRectangle?.height ?? 0),
+            elementCount: document.querySelectorAll('body *').length,
+            incompleteImages: [...document.images].filter(image => !image.complete).length
+        };
+    });
+}
+
+function signaturesMatch(left, right) {
+    return Math.abs(left.height - right.height) <= 2
+        && Math.abs(left.width - right.width) <= 2
+        && Math.abs(left.primaryWidth - right.primaryWidth) <= 2
+        && Math.abs(left.primaryHeight - right.primaryHeight) <= 2
+        && left.elementCount === right.elementCount
+        && left.incompleteImages === right.incompleteImages;
+}
+
+export async function waitForLayoutStability(page, options = {}) {
+    const settings = { ...DEFAULT_CAPTURE_OPTIONS, ...options };
+    const deadline = Date.now() + settings.layoutStabilityTimeoutMs;
+    let previous = await layoutSignature(page);
+    let stableSamples = 1;
+
+    while (Date.now() < deadline) {
+        await delay(settings.layoutStabilityIntervalMs);
+        const current = await layoutSignature(page);
+        stableSamples = signaturesMatch(previous, current) ? stableSamples + 1 : 1;
+        previous = current;
+
+        if (stableSamples >= settings.layoutStableSamples) {
+            return current;
+        }
+    }
+
+    throw new Error(
+        `Page layout did not stabilize within ${settings.layoutStabilityTimeoutMs}ms.`
+    );
+}
+
+export async function inspectPageLayout(page, requestedWidth) {
+    return page.evaluate(width => {
+        function visualState(element) {
+            for (let current = element; current; current = current.parentElement) {
+                const style = getComputedStyle(current);
+                if (
+                    style.display === 'none'
+                    || style.visibility === 'hidden'
+                ) {
+                    return 'not-laid-out';
+                }
+                if (Number.parseFloat(style.opacity) <= 0.01) {
+                    return 'transparent';
+                }
+            }
+            return 'visible';
+        }
+
+        const documentElement = document.documentElement;
+        const body = document.body;
+        const primary = document.querySelector('main, [role="main"], #main, .site-main') ?? body;
+        const primaryRectangle = primary?.getBoundingClientRect();
+        const textEntries = [...(primary?.querySelectorAll('*') ?? [])]
+            .map(element => {
+                const directText = [...element.childNodes]
+                    .filter(node => node.nodeType === Node.TEXT_NODE)
+                    .map(node => node.textContent)
+                    .join(' ')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+                return {
+                    element,
+                    length: directText.length,
+                    rectangle: element.getBoundingClientRect(),
+                    visualState: visualState(element)
+                };
+            })
+            .filter(entry => entry.length >= 20);
+        const laidOutTextEntries = textEntries.filter(entry => (
+            entry.visualState !== 'not-laid-out'
+            && entry.rectangle.width >= 1
+            && entry.rectangle.height >= 1
+        ));
+        const visibleTextEntries = laidOutTextEntries.filter(entry => (
+            entry.visualState === 'visible'
+            && entry.rectangle.width >= 1
+            && entry.rectangle.height >= 1
+        ));
+        const textWidths = visibleTextEntries
+            .map(entry => entry.rectangle.width)
+            .sort((left, right) => left - right);
+        const widthPercentile = percentile => (
+            textWidths.length === 0
+                ? 0
+                : textWidths[Math.min(
+                    textWidths.length - 1,
+                    Math.floor((textWidths.length - 1) * percentile)
+                )]
+        );
+        const totalTextLength = laidOutTextEntries.reduce(
+            (total, entry) => total + entry.length,
+            0
+        );
+        const visibleTextLength = visibleTextEntries.reduce(
+            (total, entry) => total + entry.length,
+            0
+        );
+        const pageScrollWidth = Math.ceil(Math.max(
+            body?.scrollWidth ?? 0,
+            documentElement.scrollWidth
+        ));
+        const reasons = [];
+
+        if (pageScrollWidth > width * 1.25) {
+            reasons.push(
+                `page scroll width ${pageScrollWidth}px exceeds the ${width}px viewport`
+            );
+        }
+
+        if (
+            totalTextLength >= 500
+            && visibleTextLength < totalTextLength * 0.35
+        ) {
+            reasons.push(
+                `only ${visibleTextLength} of ${totalTextLength} text characters are visibly rendered`
+            );
+        }
+
+        const textWidth75 = Math.round(widthPercentile(0.75));
+        if (
+            width >= 1_000
+            && totalTextLength >= 500
+            && textWidths.length >= 8
+            && textWidth75 < Math.min(240, width * 0.18)
+        ) {
+            reasons.push(
+                `desktop text containers are abnormally narrow (75th percentile ${textWidth75}px)`
+            );
+        }
+
+        if (
+            width >= 1_000
+            && totalTextLength >= 500
+            && primaryRectangle
+            && primaryRectangle.width < width * 0.35
+        ) {
+            reasons.push(
+                `primary content width ${Math.round(primaryRectangle.width)}px is too narrow for the ${width}px viewport`
+            );
+        }
+
+        return {
+            valid: reasons.length === 0,
+            reasons,
+            metrics: {
+                viewportWidth: width,
+                pageScrollWidth,
+                primaryWidth: Math.round(primaryRectangle?.width ?? 0),
+                totalTextLength,
+                visibleTextLength,
+                meaningfulTextElements: textWidths.length,
+                textWidth75
+            }
+        };
+    }, requestedWidth);
 }
 
 export function shouldUseTiledCapture(width, height, options = {}) {
@@ -793,47 +1064,149 @@ export async function captureUrlAtWidth(page, {
     options = {}
 }) {
     const settings = { ...DEFAULT_CAPTURE_OPTIONS, ...options };
-    await page.setViewport({
-        width,
-        height: settings.viewportHeight,
-        deviceScaleFactor: 1
-    });
-    await page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]);
-    await page.goto(url, { waitUntil: 'networkidle2' });
-    await installReducedMotionStyles(page);
-    await delay(settings.initialSettleDelayMs);
-    const initialOverlayResult = await suppressBlockingOverlays(page, settings);
-    await lazyLoadPage(page, settings);
-    const finalOverlayResult = await suppressBlockingOverlays(page, settings);
+    const assetMonitor = createAssetMonitor(page, url);
+    let readiness;
+    let layout;
 
-    const pageHeight = await measureFullPageHeight(page);
-    const outputPath = outputPathFor(url, width, outputDirectory);
-    const overlaysSuppressed = initialOverlayResult.dismissed
-        + initialOverlayResult.hidden
-        + finalOverlayResult.dismissed
-        + finalOverlayResult.hidden;
+    try {
+        await page.setViewport({
+            width,
+            height: settings.viewportHeight,
+            deviceScaleFactor: 1
+        });
+        await page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]);
+        const navigationResponse = await page.goto(url, { waitUntil: 'networkidle2' });
+        if (navigationResponse && navigationResponse.status() >= 400) {
+            throw new Error(
+                `Page navigation returned HTTP ${navigationResponse.status()} for ${url}.`
+            );
+        }
 
-    if (!shouldUseTiledCapture(width, pageHeight, settings)) {
-        await page.screenshot({ path: outputPath, fullPage: true });
-        return {
-            mode: 'single',
+        await installReducedMotionStyles(page);
+        await delay(settings.initialSettleDelayMs);
+        readiness = await waitForPageAssets(page, settings.assetReadyTimeoutMs);
+
+        const initialCriticalFailures = assetMonitor.failures.filter(failure => failure.critical);
+        if (readiness.pendingStylesheets.length > 0 || initialCriticalFailures.length > 0) {
+            const details = [
+                ...initialCriticalFailures.map(failure => (
+                    `${failure.resourceType} ${failure.status ?? failure.errorText}: ${failure.url}`
+                )),
+                ...readiness.pendingStylesheets.map(stylesheet => (
+                    `stylesheet did not become ready: ${stylesheet}`
+                ))
+            ];
+            throw new Error(`Critical page assets failed to load: ${details.join('; ')}`);
+        }
+
+        const initialOverlayResult = await suppressBlockingOverlays(page, settings);
+        await lazyLoadPage(page, settings);
+        const finalOverlayResult = await suppressBlockingOverlays(page, settings);
+        await waitForImages(page, settings.imageLoadTimeoutMs);
+        await waitForLayoutStability(page, settings);
+
+        const finalCriticalFailures = assetMonitor.failures.filter(failure => failure.critical);
+        if (finalCriticalFailures.length > 0) {
+            const details = finalCriticalFailures.map(failure => (
+                `${failure.resourceType} ${failure.status ?? failure.errorText}: ${failure.url}`
+            ));
+            throw new Error(`Critical page assets failed to load: ${details.join('; ')}`);
+        }
+
+        layout = await inspectPageLayout(page, width);
+        if (!layout.valid) {
+            throw new Error(`Suspicious page layout detected: ${layout.reasons.join('; ')}.`);
+        }
+
+        const pageHeight = await measureFullPageHeight(page);
+        const outputPath = outputPathFor(url, width, outputDirectory);
+        const overlaysSuppressed = initialOverlayResult.dismissed
+            + initialOverlayResult.hidden
+            + finalOverlayResult.dismissed
+            + finalOverlayResult.hidden;
+        const diagnostics = {
+            readiness,
+            layout,
+            assetFailures: assetMonitor.failures
+        };
+
+        if (!shouldUseTiledCapture(width, pageHeight, settings)) {
+            await page.screenshot({ path: outputPath, fullPage: true });
+            return {
+                mode: 'single',
+                outputPath,
+                width,
+                height: pageHeight,
+                tileCount: 1,
+                overlaysSuppressed,
+                diagnostics
+            };
+        }
+
+        const result = await captureLongPage(page, {
             outputPath,
             width,
-            height: pageHeight,
-            tileCount: 1,
-            overlaysSuppressed
+            pageHeight,
+            outputDirectory,
+            filename: path.basename(outputPath, '.png'),
+            overlaysSuppressed,
+            options: settings
+        });
+        return { ...result, diagnostics };
+    } catch (error) {
+        error.captureDiagnostics = {
+            readiness,
+            layout,
+            assetFailures: assetMonitor.failures
         };
+        throw error;
+    } finally {
+        assetMonitor.stop();
+    }
+}
+
+export async function captureUrlWithRetry(browser, {
+    url,
+    width,
+    outputDirectory,
+    options = {}
+}) {
+    const settings = { ...DEFAULT_CAPTURE_OPTIONS, ...options };
+    const configuredAttempts = Number(settings.maxCaptureAttempts);
+    const maximumAttempts = Number.isFinite(configuredAttempts)
+        ? Math.max(1, Math.floor(configuredAttempts))
+        : DEFAULT_CAPTURE_OPTIONS.maxCaptureAttempts;
+    const retryReasons = [];
+    let lastError;
+
+    for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
+        let context;
+
+        try {
+            context = await browser.createBrowserContext();
+            const page = await context.newPage();
+            const result = await captureUrlAtWidth(page, {
+                url,
+                width,
+                outputDirectory,
+                options: settings
+            });
+            return {
+                ...result,
+                attempts: attempt,
+                retryReasons
+            };
+        } catch (error) {
+            lastError = error;
+            retryReasons.push(error.message);
+        } finally {
+            await context?.close().catch(() => {});
+        }
     }
 
-    return captureLongPage(page, {
-        outputPath,
-        width,
-        pageHeight,
-        outputDirectory,
-        filename: path.basename(outputPath, '.png'),
-        overlaysSuppressed,
-        options: settings
-    });
+    lastError.message = `${lastError.message} Capture failed after ${maximumAttempts} isolated attempt(s).`;
+    lastError.retryReasons = retryReasons;
+    throw lastError;
 }
 
 export function parseArguments(args, cwd = process.cwd()) {
@@ -908,7 +1281,6 @@ export async function takeScreenshots(args = process.argv.slice(2), launchOption
     await fsPromises.mkdir(outputDirectory, { recursive: true });
 
     const browser = await puppeteer.launch(launchOptions);
-    const page = await browser.newPage();
     const results = [];
     let failed = false;
 
@@ -916,7 +1288,7 @@ export async function takeScreenshots(args = process.argv.slice(2), launchOption
         for (const url of urls) {
             for (const width of viewportWidths) {
                 try {
-                    const result = await captureUrlAtWidth(page, {
+                    const result = await captureUrlWithRetry(browser, {
                         url,
                         width,
                         outputDirectory,
@@ -927,8 +1299,11 @@ export async function takeScreenshots(args = process.argv.slice(2), launchOption
                     const overlayDetail = result.overlaysSuppressed > 0
                         ? `; suppressed ${result.overlaysSuppressed} blocking overlay element(s)`
                         : '';
+                    const retryDetail = result.attempts > 1
+                        ? `; succeeded on isolated attempt ${result.attempts}`
+                        : '';
                     console.log(
-                        `Screenshot saved for ${url} at ${result.outputPath} with width ${width}px${detail}${overlayDetail}`
+                        `Screenshot saved for ${url} at ${result.outputPath} with width ${width}px${detail}${overlayDetail}${retryDetail}`
                     );
                 } catch (error) {
                     failed = true;

@@ -8,6 +8,8 @@ Pages up to 28,000px tall use Puppeteer's existing one-shot `fullPage` capture, 
 
 Before lazy loading and again immediately before capture, the tool suppresses high-confidence blocking overlays such as open dialogs, promotional popovers, lightboxes, and their backdrops. Detection combines dialog semantics, fixed-position viewport coverage, stacking order, dismiss controls, modal-related names, and page scroll locks. It first attempts a safe dismissal, then hides any remaining blocker and restores document scrolling. Legitimate fixed visual elements are left alone unless they also exhibit modal behavior.
 
+Every URL-and-width combination runs in a fresh isolated browser context so cookies, storage, responsive scripts, and DOM mutations cannot leak between breakpoints. Before capture, the tool waits for fonts and stylesheets, lazy-loads the page, and requires the page geometry to remain stable across multiple samples. Failed critical stylesheets/scripts, excessive horizontal overflow, mostly invisible text, or abnormally narrow desktop content cause the attempt to fail. The tool retries once in another fresh context before reporting an error.
+
 Before every tile, the page is locked to the exact scroll offset and allowed to settle. Fixed and sticky UI is suppressed—including widgets rendered through zero-size hosts or open shadow DOM—so headers, modals, and accessibility launchers do not repeat at tile joins. The stitched result is validated before it replaces the final output file.
 
 ## Installation
@@ -83,7 +85,7 @@ Tiled captures are checked for the requested width, a height close to the measur
 
 ## Tests
 
-The browser tests cover the normal one-shot path, semantic and delayed blocking overlays, scroll-lock recovery, explicit selector overrides, false-positive protection for legitimate fixed content, a long page reaching its true footer, lazy-loaded content, fixed and shadow-DOM overlays, successful temporary-file cleanup, and retained diagnostics for repeated-tile failures:
+The browser tests cover the normal one-shot path, isolated browser state, unstable-layout retries, critical stylesheet retries, semantic and delayed blocking overlays, scroll-lock recovery, explicit selector overrides, false-positive protection for legitimate fixed content, a long page reaching its true footer, lazy-loaded content, fixed and shadow-DOM overlays, successful temporary-file cleanup, and retained diagnostics for repeated-tile failures:
 
 ```bash
 npm test
